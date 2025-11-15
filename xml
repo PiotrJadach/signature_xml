@@ -1,0 +1,249 @@
+import base64
+import uuid
+from datetime import datetime, timezone
+from lxml import etree
+import xmlsec
+# POPRAWIONY IMPORT: load_pem_x509_certificate przeniesione do cryptography.x509
+from cryptography.hazmat.primitives.serialization import pkcs12, Encoding, PrivateFormat, NoEncryption, load_pem_private_key
+from cryptography.x509 import load_pem_x509_certificate 
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes
+import re
+import os
+
+# =======================================================
+# Wprowadzone zmienne (Klucze i Hasło)
+# Zmienne te powinny być bezpiecznie przechowywane.
+# =======================================================
+klucz_prywatny_zaszyfrowany = """
+-----BEGIN ENCRYPTED PRIVATE KEY-----
+-----END ENCRYPTED PRIVATE KEY-----
+"""
+klucz_publiczny = """
+-----BEGIN CERTIFICATE-----
+-----END CERTIFICATE-----
+"""
+haslo_klucz_prywatny = b"" 
+
+# =======================
+# Konfiguracja XML i przestrzeni nazw
+# =======================
+xml_input_file = "auth.xml" # Plik wejściowy XML
+xml_output_file = r"C:\xxxxxxDesktop\python\xml_sign\podpisany.xml"
+
+DS_NS = "http://www.w3.org/2000/09/xmldsig#"
+XADES_NS = "http://uri.etsi.org/01903/v1.3.2#"
+EXC_C14N = "http://www.w3.org/2001/10/xml-exc-c14n#"
+
+# Rejestracja przestrzeni nazw używanych przez KSeF i podpis
+etree.register_namespace('ds', DS_NS)
+etree.register_namespace('xades', XADES_NS)
+NSMAP = {
+    "ds": DS_NS,
+    "xades": XADES_NS,
+    # Domyślna przestrzeń nazw dla AuthTokenRequest (jest już na elemencie głównym)
+    # Zostawiamy 'None' w celu prawidłowego renderowania XAdES
+    None: "http://ksef.mf.gov.pl/auth/token/2.0" 
+}
+
+
+# =======================================================
+# Krok 1: Odszyfrowanie i wczytanie kluczy
+# =======================================================
+print("Ładowanie klucza prywatnego i certyfikatu...")
+try:
+    # A. Odszyfrowanie klucza prywatnego
+    private_key_decoded = load_pem_private_key(
+        klucz_prywatny_zaszyfrowany.strip().encode('utf-8'), 
+        password=haslo_klucz_prywatny, 
+        backend=default_backend()
+    )
+    private_key_pem = private_key_decoded.private_bytes(
+        encoding=Encoding.PEM,
+        format=PrivateFormat.PKCS8,
+        encryption_algorithm=NoEncryption()
+    )
+
+    # B. Wczytanie certyfikatu
+    cert = load_pem_x509_certificate(
+        klucz_publiczny.strip().encode('utf-8'),
+        backend=default_backend()
+    )
+    cert_pem = klucz_publiczny.strip().encode('utf-8')
+    cert_der = cert.public_bytes(Encoding.DER)
+    
+except Exception as e:
+    print(f"❌ Błąd podczas wczytywania/odszyfrowania kluczy: {e}")
+    exit()
+print("✅ Klucze i certyfikat załadowane pomyślnie.")
+
+# =======================================================
+# Krok 2: Wczytaj XML z pliku
+# =======================================================
+print(f"Wczytywanie pliku wejściowego '{xml_input_file}'...")
+if not os.path.exists(xml_input_file):
+    print(f"❌ Błąd: Brak pliku wejściowego '{xml_input_file}'. Upewnij się, że plik istnieje.")
+    exit()
+
+try:
+    tree = etree.parse(xml_input_file)
+    root = tree.getroot()
+except etree.XMLSyntaxError as e:
+    print(f"❌ Błąd składni XML w pliku '{xml_input_file}': {e}")
+    exit()
+print("✅ Plik XML wczytany.")
+
+# =======================================================
+# Krok 3: Przygotowanie identyfikatorów
+# =======================================================
+sig_id = f"Signature-{uuid.uuid4()}"
+qp_id = f"QualifyingProps-{uuid.uuid4()}"
+sp_id = f"SignedProperties-{uuid.uuid4()}"
+
+# =======================================================
+# Krok 4: Utwórz szablon podpisu (XAdES-BES Enveloped Signature)
+# =======================================================
+signature_node = xmlsec.template.create(
+    root,
+    xmlsec.Transform.EXCL_C14N,
+    xmlsec.Transform.ECDSA_SHA256, # Używamy ECDSA-SHA256 dla certyfikatu KSeF/kwalifikowanego
+    ns="ds"
+)
+signature_node.set("Id", sig_id)
+# Wstawienie Signature_node w odpowiednim miejscu (na końcu elementu głównego)
+root.append(signature_node)
+
+# =======================
+# Reference 1: Cały dokument (URI="")
+# Transformacje: ENVELOPED i EXC_C14N
+# =======================
+ref_doc = xmlsec.template.add_reference(signature_node, xmlsec.Transform.SHA256, uri="")
+xmlsec.template.add_transform(ref_doc, xmlsec.Transform.ENVELOPED) 
+xmlsec.template.add_transform(ref_doc, xmlsec.Transform.EXCL_C14N) 
+
+# =======================
+# KeyInfo / X509Data
+# Wymagane przez KSeF dla certyfikatu.
+# =======================
+key_info = xmlsec.template.ensure_key_info(signature_node)
+xmlsec.template.add_x509_data(key_info)
+
+# =======================================================
+# Krok 5: Dodaj XAdES-BES Object (SignedProperties)
+# =======================================================
+object_node = etree.SubElement(signature_node, etree.QName(DS_NS, "Object"), nsmap=NSMAP)
+qualifying_properties = etree.SubElement(
+    object_node,
+    etree.QName(XADES_NS, "QualifyingProperties"),
+    Id=qp_id,
+    Target="#" + sig_id, # Odwołanie do elementu Signature
+    nsmap=NSMAP
+)
+signed_properties = etree.SubElement(
+    qualifying_properties,
+    etree.QName(XADES_NS, "SignedProperties"),
+    Id=sp_id,
+    nsmap=NSMAP
+)
+signed_signature_properties = etree.SubElement(
+    signed_properties,
+    etree.QName(XADES_NS, "SignedSignatureProperties"),
+    nsmap=NSMAP
+)
+
+# A. SigningTime (Wymagane przez KSeF)
+local_time = datetime.now(timezone.utc)
+signing_time = etree.SubElement(
+    signed_signature_properties,
+    etree.QName(XADES_NS, "SigningTime"),
+    nsmap=NSMAP
+)
+# Formatowanie czasu: YYYY-MM-DDTHH:MM:SS.sssZ
+signing_time.text = local_time.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + 'Z'
+
+# B. SigningCertificate (Wymagane przez KSeF)
+digest = hashes.Hash(hashes.SHA256())
+digest.update(cert_der)
+cert_digest_b64 = base64.b64encode(digest.finalize()).decode("utf-8")
+
+signing_certificate = etree.SubElement(signed_signature_properties, etree.QName(XADES_NS, "SigningCertificate"), nsmap=NSMAP)
+cert_node = etree.SubElement(signing_certificate, etree.QName(XADES_NS, "Cert"), nsmap=NSMAP)
+
+# CertDigest
+cert_digest = etree.SubElement(cert_node, etree.QName(XADES_NS, "CertDigest"), nsmap=NSMAP)
+digest_method = etree.SubElement(cert_digest, etree.QName(DS_NS, "DigestMethod"), nsmap=NSMAP)
+# KSeF używa SHA-256
+digest_method.set("Algorithm", "http://www.w3.org/2001/04/xmlenc#sha256")
+digest_value = etree.SubElement(cert_digest, etree.QName(DS_NS, "DigestValue"), nsmap=NSMAP)
+digest_value.text = cert_digest_b64
+
+# IssuerSerial
+issuer_serial = etree.SubElement(cert_node, etree.QName(XADES_NS, "IssuerSerial"), nsmap=NSMAP)
+issuer_name = etree.SubElement(issuer_serial, etree.QName(DS_NS, "X509IssuerName"), nsmap=NSMAP)
+issuer_name.text = cert.issuer.rfc4514_string()
+serial_number = etree.SubElement(issuer_serial, etree.QName(DS_NS, "X509SerialNumber"), nsmap=NSMAP)
+# Ważne: W xmlsec numer seryjny jest często używany jako str
+serial_number.text = str(cert.serial_number) 
+
+# C. SignaturePolicyIdentifier (Implied to najprostsza forma XAdES)
+spi = etree.SubElement(signed_signature_properties, etree.QName(XADES_NS, "SignaturePolicyIdentifier"), nsmap=NSMAP)
+etree.SubElement(spi, etree.QName(XADES_NS, "SignaturePolicyImplied"), nsmap=NSMAP)
+
+# D. SignerRole (Przykład - nie zawsze wymagane)
+signer_role = etree.SubElement(signed_signature_properties, etree.QName(XADES_NS, "SignerRole"), nsmap=NSMAP)
+claimed_roles = etree.SubElement(signer_role, etree.QName(XADES_NS, "ClaimedRoles"), nsmap=NSMAP)
+etree.SubElement(claimed_roles, etree.QName(XADES_NS, "ClaimedRole"), nsmap=NSMAP).text = "Podpisujący" 
+
+# =======================
+# Reference 2: SignedProperties (Wymagane przez XAdES)
+# Odwołuje się do elementu SignedProperties, który jest częścią Object
+# =======================
+ref_props = xmlsec.template.add_reference(
+    signature_node,
+    xmlsec.Transform.SHA256,
+    uri="#" + sp_id,
+    type="http://uri.etsi.org/01903#SignedProperties" # Wymagany atrybut Type
+)
+xmlsec.template.add_transform(ref_props, xmlsec.Transform.EXCL_C14N)
+
+# =======================================================
+# Krok 6: Podpisanie
+# =======================================================
+print("Podpisywanie dokumentu...")
+key = xmlsec.Key.from_memory(private_key_pem, xmlsec.constants.KeyDataFormatPem, None)
+key.load_cert_from_memory(cert_pem, xmlsec.constants.KeyDataFormatPem)
+
+ctx = xmlsec.SignatureContext()
+ctx.key = key
+ctx.sign(signature_node)
+print("✅ Dokument został podpisany.")
+
+# =======================================================
+# Krok 7: KRYTYCZNY KROK: Oczyszczenie X509Certificate (ostatnia poprawka)
+# KSeF często odrzuca podpis, jeśli są białe znaki w tym polu.
+# =======================================================
+pure_cert_b64_str = re.sub(r'-----BEGIN CERTIFICATE-----|-----END CERTIFICATE-----|\s', '', cert_pem.decode('utf-8')).strip()
+
+x509_cert_node = signature_node.find(f".//{{{DS_NS}}}X509Certificate")
+if x509_cert_node is not None:
+     x509_cert_node.text = pure_cert_b64_str
+     print("✅ Poprawiono format X509Certificate (usunięto białe znaki).")
+else:
+     print("⚠️ Ostrzeżenie: Nie znaleziono elementu X509Certificate do oczyszczenia.")
+
+
+# =======================================================
+# Krok 8: Zapis podpisanego XML
+# =======================================================
+output_dir = os.path.dirname(xml_output_file)
+if output_dir and not os.path.exists(output_dir):
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        print(f"Utworzono katalog: {output_dir}")
+    except OSError as e:
+        print(f"❌ Błąd tworzenia katalogu {output_dir}: {e}")
+        exit()
+
+# Używamy obiektu 'tree' z etree.parse() do zapisu
+tree.write(xml_output_file, encoding="UTF-8", xml_declaration=True, pretty_print=False) 
+print(f"✅ Dokument podpisany i zapisany jako: {xml_output_file}")
