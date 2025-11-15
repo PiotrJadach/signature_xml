@@ -13,7 +13,6 @@ import os
 
 # =======================================================
 # Wprowadzone zmienne (Klucze i Hasło)
-# Zmienne te powinny być bezpiecznie przechowywane.
 # =======================================================
 klucz_prywatny_zaszyfrowany = """
 -----BEGIN ENCRYPTED PRIVATE KEY-----
@@ -26,7 +25,7 @@ klucz_publiczny = """
 haslo_klucz_prywatny = b"" 
 
 # =======================
-# Konfiguracja XML i przestrzeni nazw
+# Konfiguracja XML
 # =======================
 xml_input_file = "auth.xml" # Plik wejściowy XML
 xml_output_file = r"C:\xxxxxxDesktop\python\xml_sign\podpisany.xml"
